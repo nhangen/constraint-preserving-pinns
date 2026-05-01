@@ -12,9 +12,9 @@ Physics-informed neural networks (PINNs) can model physical systems by embedding
 
 A valid density matrix must satisfy:
 
-- Hermiticity: \(\rho = \rho^\dagger\)
-- Positive semidefiniteness: \(\rho \succeq 0\)
-- Unit trace: \(\operatorname{Tr}(\rho)=1\)
+- Hermiticity: $\rho = \rho^\dagger$
+- Positive semidefiniteness: $\rho \succeq 0$
+- Unit trace: $\mathrm{Tr}(\rho)=1$
 
 This work introduces a constraint-preserving PINN architecture for Lindblad quantum dynamics. Instead of predicting density-matrix entries directly, the network predicts parameters of an auxiliary matrix \(A(t)\), then constructs
 
@@ -32,7 +32,14 @@ This guarantees quantum-state validity by construction before the Lindblad resid
 ├── paper.tex          # LaTeX source
 ├── references.bib     # Bibliography file
 ├── figures/           # Manuscript figures
-├── code/              # Supporting or reproduction code
-├── results/           # Experimental outputs and generated results
 ├── README.md
 └── LICENSE
+```
+
+## Planned Additions
+
+```text
+code/                  # Supporting or reproduction code
+results/               # Experimental outputs and generated results
+CITATION.cff           # Formal citation metadata
+```
