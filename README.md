@@ -43,3 +43,27 @@ code/                  # Supporting or reproduction code
 results/               # Experimental outputs and generated results
 CITATION.cff           # Formal citation metadata
 ```
+
+## Citation
+
+A formal citation file will be added after the manuscript metadata is finalized.
+
+For now, cite as:
+
+```bibtex
+@misc{hangen2026constraintpreservingpinns,
+  title        = {Constraint-Preserving PINNs for Lindblad Quantum Dynamics},
+  author       = {Hangen, Nathan},
+  year         = {2026},
+  institution  = {Wright State University},
+  note         = {Working manuscript}
+}
+```
+
+## License
+
+This manuscript, figures, and documentation are licensed under the Creative Commons Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0).
+
+Derivative works must be distributed under the same or a compatible license.
+
+Code, if added later, may be licensed separately.
