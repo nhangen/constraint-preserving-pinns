@@ -18,9 +18,9 @@ A valid density matrix must satisfy:
 
 This work introduces a constraint-preserving PINN architecture for Lindblad quantum dynamics. Instead of predicting density-matrix entries directly, the network predicts parameters of an auxiliary matrix \(A(t)\), then constructs
 
-\[
-\rho(t)=\frac{A(t)A^\dagger(t)}{\operatorname{Tr}(A(t)A^\dagger(t))}
-\]
+```math
+\rho(t)=\frac{A(t)A^\dagger(t)}{\mathrm{Tr}(A(t)A^\dagger(t))}
+```
 
 This guarantees quantum-state validity by construction before the Lindblad residual is evaluated.
 
@@ -28,11 +28,11 @@ This guarantees quantum-state validity by construction before the Lindblad resid
 
 ```text
 .
-├── paper.pdf        # Manuscript PDF
-├── paper.tex        # LaTeX source
-├── figures/         # Manuscript figures
-├── bib/             # Bibliography files
-├── code/            # Supporting or reproduction code
-├── results/         # Experimental outputs and generated results
+├── paper.pdf          # Manuscript PDF
+├── paper.tex          # LaTeX source
+├── references.bib     # Bibliography file
+├── figures/           # Manuscript figures
+├── code/              # Supporting or reproduction code
+├── results/           # Experimental outputs and generated results
 ├── README.md
 └── LICENSE
