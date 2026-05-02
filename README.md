@@ -32,6 +32,7 @@ This guarantees quantum-state validity by construction before the Lindblad resid
 ├── paper.tex          # LaTeX source
 ├── references.bib     # Bibliography file
 ├── figures/           # Manuscript figures
+├── presentation/      # Slide deck
 ├── README.md
 └── LICENSE
 ```
