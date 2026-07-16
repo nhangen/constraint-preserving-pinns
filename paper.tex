@@ -7,12 +7,19 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{float}
+\usepackage{hyperref}
 
 \geometry{margin=1in}
 
-\title{Constraint-Preserving PINNs for Lindblad Quantum Dynamics}
+\title{Structural Unitarity and Time-Marching Close the Local-vs-Global Gap in Constraint-Preserving Quantum PINNs}
 
-\author{Nathan Hangen \\ Department of Physics \\ Wright State University}
+% Affiliation: Independent Researcher (default). If a formal appointment at
+% University of Michigan-Dearborn is appropriate (research scholar / visiting
+% researcher / adjunct / courtesy), switch to:
+%   \author{Nathan Hangen \\ University of Michigan-Dearborn}
+% Geographic colocation alone is not an affiliation. Pure independent work →
+% the line below.
+\author{Nathan Hangen \\ Independent Researcher}
 
 \date{}
 
@@ -22,502 +29,357 @@
 
 \begin{abstract}
 
-Physics-informed neural networks (PINNs) have emerged as powerful tools for modeling physical systems by embedding differential equations within neural architectures.
-However, quantum systems impose strict physical constraints: density matrices must remain Hermitian, positive semidefinite, and trace normalized. 
-Standard PINN approaches enforce these constraints through penalty terms in the loss function, which does not guarantee physical validity.
-
-We introduce a constraint-preserving PINN architecture that guarantees quantum state validity by construction using a trace-normalized Gram matrix parameterization. 
-This removes entire categories of failure seen in penalty-based approaches and produces stable training across repeated runs. 
-Across 100 independent training trials our model achieved a 99\% success rate under explicitly defined physical validity criteria, while a penalty-based baseline succeeded in 67\% of trials.
-
-We further introduce a quantum hardware validation pipeline using IBM quantum processors. 
-A discrepancy between PINN predictions and hardware measurements revealed an initial-condition mismatch and highlighted the role of stationary states in Lindblad dynamics. 
-Hardware validation therefore functions as a diagnostic tool for identifying modeling inconsistencies. 
-Our results provide a framework for combining physics-informed machine learning with experimental quantum systems.
-We also characterize spectral bias in density-matrix PINNs and provide a frequency-domain supplement.
+In prior work~\cite{hangen2024constraint} we introduced constraint-preserving PINNs for Lindblad quantum dynamics, using a trace-normalized Gram-matrix parameterization to guarantee Hermiticity, positive semidefiniteness, and unit trace by construction. That work demonstrated 99\% training success on a 1-qubit pure-dephasing problem with $T = 5$. In this paper we extend the methodology to closed-system unitary dynamics on longer time intervals and to multi-qubit systems, and we report a previously-undocumented failure mode: the physics residual converges to near zero while the model trajectory drifts by an order-one Frobenius distance from the analytic solution. We call this the \textbf{local-vs-global gap}: the pointwise PDE residual at $N$ collocation points is consistent with a wide family of wrong-but-smooth solutions, and the gradient-based optimizer settles on one of them. We show the gap is dimension-independent (the same $\sim 1.0$ Frobenius trajectory error appears at 1 and 2 qubits with matched protocol) and is not closed by any of six loss-formulation modifications we tested. Two changes \emph{together} close it: (i) extending the constraint-preserving architecture to also structurally enforce the initial condition and unitary evolution, and (ii) training with a time-marching curriculum that warm-starts the optimizer on a short time interval before extending to the full one. The combination reduces median trajectory error by $\sim 180\times$ at 1 qubit (10-seed sweep, 145--210$\times$ across 9 of 10 seeds; one seed still converging at the 30{,}000-epoch budget). At 2 and 3 qubits the plain combination is high-variance seed-to-seed (2q: correct basin on 3 of 10 seeds), and closure becomes markedly more reliable with a per-stage learning-rate restart, which transfers up the qubit ladder---in a matched-seed A/B at 2 qubits it lifts the correct-basin rate from 3/10 to 8 of 10 (median $\sim\!3\times10^{-3}$, no divergences), and reaches 5 of 5 (median $\sim\!4\times10^{-3}$) at 3 qubits (and a single 4-qubit run at $9.7\times10^{-4}$)---with no attenuation of closure across the 1--4 qubit ladder. The original constraint-preserving result holds on its original problem; the gap is a scaling artifact that emerges at longer time intervals and under sustained-oscillation (closed-system) dynamics. We provide an architecture $\times$ training $\times$ qubit-count ablation isolating which piece contributes what, and we test a Stinespring-dilation Kraus generalization for the open-system case: the architecture preserves CPTP exactly but the curriculum methodology does not transfer, leaving open-system PINN training as a separate methodological problem.
 
 \end{abstract}
 
 \section{Introduction}
 
-Physics-informed neural networks (PINNs) integrate physical laws into machine learning by embedding governing differential equations into neural network training objectives \cite{raissi2019}. 
-These methods have been successfully applied across scientific domains including fluid mechanics, materials science, and plasma physics.
-Neural-network quantum states have also proven effective as compact variational representations for many-body wavefunctions, demonstrating high-accuracy ground-state and dynamical predictions \cite{carleo2016}.
+Physics-informed neural networks (PINNs) embed governing differential equations directly into the training objective of a neural network, producing a learned continuous representation of the solution that can be queried at arbitrary points~\cite{raissi2019}. For quantum systems, the basic challenge is that the state---a density matrix $\rho$---must satisfy three structural constraints: Hermiticity ($\rho = \rho^\dagger$), positive semidefiniteness ($\rho \succeq 0$), and unit trace ($\mathrm{Tr}(\rho) = 1$). Penalty-based PINNs enforce these as soft loss terms; constraint-preserving PINNs enforce them as architectural identities. The prior constraint-preserving paper~\cite{hangen2024constraint} demonstrated, on a 1-qubit pure-dephasing problem with $T = 5$, that the architectural approach trains stably (99\% success across 100 seeds vs.\ 67\% for the penalty baseline) and validates against IBM quantum hardware.
 
-Quantum systems introduce additional constraints beyond differential equations.
-A valid quantum state must be represented by a density matrix $\rho$ satisfying
+In this work we ask: does the constraint-preserving PINN methodology extend to (a) longer time intervals, (b) closed-system dynamics with sustained oscillation rather than damped decay, and (c) multi-qubit systems? We find that the methodology generalizes \emph{with one consistent failure mode}: the physics-residual loss converges to small values while the model trajectory drifts substantially from the analytic solution. This local-vs-global gap is not visible in the original setup because the original setup is short-interval and dissipative (decaying), which makes the wrong-but-smooth solution family small.
 
-\begin{enumerate}
-\item Hermiticity: $\rho = \rho^\dagger$
-\item Positivity: $\rho \succeq 0$
-\item Unit trace: $\mathrm{Tr}(\rho) = 1$
-\end{enumerate}
+We characterize this gap experimentally, demonstrate that it is dimension-independent, rule out six candidate fixes (semigroup-composition loss, terminal-pin loss, supervised trajectory loss, augmented Lagrangian formulation, Chebyshev-basis network, soft constraint reweighting), and identify the combination that closes it: a structural extension of the constraint-preserving architecture to also enforce initial conditions and unitarity, paired with a time-marching curriculum. We provide a full ablation matrix isolating the architecture and the schedule, and characterize the scaling behavior across qubit count.
 
-Traditional PINN approaches attempt to enforce these constraints using penalty terms added to the training loss.
-While such penalties reduce violations, they do not guarantee physical validity and often lead to unstable training or non-physical intermediate solutions.
+\section{Related Work}
 
-We propose an alternative strategy: embedding these constraints directly into the neural architecture.
-This guarantees that the model outputs remain physically valid throughout training and evaluation.
-Recent work on deep PINNs highlights that architectural changes are often required to mitigate depth-related pathologies and unlock stable training behavior \cite{jiang2025deeperpinns}.
+\paragraph{PINN failure modes.}
+The local-vs-global gap we report fits within a growing body of work characterizing PINN training failures. Krishnapriyan et al.~\cite{krishnapriyan2021failure} demonstrate that naive PINN training on convection-diffusion PDEs converges to wrong-but-low-loss solutions, and propose a sequence-to-sequence learning approach equivalent to our time-marching curriculum. Wang, Yu, and Perdikaris~\cite{wang2022nonregression} provide an NTK-perspective diagnostic that links these failures to gradient pathology and the spectral bias of MLPs toward low-frequency modes. Wang, Sankaran, and Perdikaris~\cite{wang2024causality} refine time-marching by enforcing temporal causality in the loss weighting. Our curriculum schedule is closest to the Krishnapriyan formulation; we apply it to quantum dynamics where it has not been previously tested, and contribute the architecture-side observation that constraint-preserving parameterizations of $\rho(t)$ are necessary but not sufficient for closure.
 
-Additionally, we explore validation of neural physics models using real quantum hardware.
-Rather than treating hardware comparisons purely as verification, we demonstrate that discrepancies between model predictions and hardware measurements can reveal modeling inconsistencies such as mismatched initial conditions or stationary states of the governing dynamics.
+\paragraph{Constrained-optimization PINNs.}
+Lu et al.~\cite{lu2021hard} cast PINN training as a hard-constrained optimization problem with augmented Lagrangian solvers. McClenny and Braga-Neto~\cite{mcclenny2022sapinn} use per-collocation-point adaptive weights as a soft proxy for Lagrange multipliers. We test the augmented-Lagrangian variant on our problem (Table~\ref{tab:six-failed}) and find that schedule sensitivity prevents it from closing the gap in our setting; the failure mode there is distinct from the methodology proposed in~\cite{lu2021hard}, which targets boundary-condition enforcement rather than long-interval trajectory recovery.
 
-The baseline PINN used for comparison follows the standard approach in the physics-informed neural network literature, where density matrix elements are predicted directly and physical constraints are enforced through loss penalties rather than architectural guarantees.
-This comparison is motivated in part by evidence that gradient-based training favors low-frequency functions, an implicit bias that can dominate learning dynamics in PINNs and promote overly smooth or stationary solutions \cite{rahaman2019,xu2018,arpit2017,neyshabur2014,zhang2017}.
+\paragraph{Curriculum learning.}
+The general curriculum-learning framework~\cite{bengio2009curriculum} of training on easy examples first and progressively harder ones predates PINN-specific applications. Time-marching in PDE solvers~\cite{krishnapriyan2021failure,wang2024causality} is a domain-specific instance. Our contribution is the empirical isolation of which architecture choices make the curriculum work for quantum trajectories.
 
-\section{Quantum Dynamics Background}
+\paragraph{Architectural quantum-state validity.}
+\begin{sloppypar}
+The trace-normalized Gram-matrix parameterization of~\cite{hangen2024constraint} is one of several approaches to guaranteeing quantum-state validity by construction. Vectorized-Bloch and Cholesky-style parameterizations of density matrices are standard in numerical linear algebra~\cite{horn1990}. Our structural unitary parameterization $\rho = U \rho_0 U^\dagger$ (with $U = \exp(-i A)$) extends this family by additionally enforcing initial conditions and unitary evolution structurally. The Kraus-via-Stinespring extension (Section~\ref{sec:openkraus}) further adds CPTP for open systems.
+\end{sloppypar}
 
-\subsection{Density Matrices}
+\section{Background}
 
-The state of a quantum system can be represented by a density matrix $\rho$ \cite{breuer2002}.
-For a two-level system (qubit),
+\subsection{Density matrices and equations of motion}
 
+A density matrix $\rho \in \mathbb{C}^{d \times d}$ (with $d = 2^n$ for $n$ qubits) is a Hermitian PSD trace-1 matrix describing a quantum state. For a closed system, evolution is governed by the von Neumann equation
 \begin{equation}
-\rho =
-\begin{pmatrix}
-\rho_{00} & \rho_{01} \\
-\rho_{10} & \rho_{11}
-\end{pmatrix}
-\label{densitymatrix}
+\frac{d\rho}{dt} = -i[H, \rho],
+\label{eq:vn}
 \end{equation}
-
-where diagonal elements represent populations and off-diagonal elements represent quantum coherences.
-
-A physically valid density matrix must be Hermitian, positive semidefinite, and trace normalized.
-
-\subsection{Lindblad Master Equation}
-
-Open quantum system dynamics are governed by the Lindblad master equation \cite{lindblad1976,breuer2002}
-
+with analytic solution $\rho(t) = U(t) \rho(0) U(t)^\dagger$ where $U(t) = \exp(-i H t)$ is unitary. For an open system the Lindblad equation
 \begin{equation}
-\frac{d\rho}{dt}
-=
--i[H,\rho]
-+
-L \rho L^\dagger
--
-\frac{1}{2}
-\{L^\dagger L,\rho\}
-\label{lindblad}
+\frac{d\rho}{dt} = -i[H, \rho] + \sum_k \gamma_k \left( L_k \rho L_k^\dagger - \tfrac{1}{2} \{L_k^\dagger L_k, \rho\} \right)
+\label{eq:lindblad}
 \end{equation}
+adds a dissipative term with jump operators $L_k$ and rates $\gamma_k$. With $\gamma_k = 0$ Eq.~(\ref{eq:lindblad}) reduces to Eq.~(\ref{eq:vn}); the closed system is the special case.
 
-where $H$ is the system Hamiltonian, $L$ is the Lindblad operator describing dissipation, and $\sigma_x,\sigma_y,\sigma_z$ denote the Pauli operators. Here $[\cdot,\cdot]$ denotes a commutator and $\{\cdot,\cdot\}$ denotes an anticommutator.
+\subsection{Constraint-preserving PINN baseline}
 
-For pure dephasing with $L = \sqrt{\gamma}\sigma_z$, the populations remain constant while the off-diagonal coherence decays exponentially.
-
-Importantly, any density matrix diagonal in the $\sigma_z$ basis is stationary under pure dephasing dynamics.
-For this case the dissipator generated by $L=\sqrt{\gamma}\sigma_z$ leaves all states diagonal in the $\sigma_z$ basis unchanged.
-The maximally mixed state
-
+Following~\cite{hangen2024constraint}, we parameterize
 \begin{equation}
-\rho = \frac{I}{2}
-\label{maxmixed}
+\rho(t) = \frac{L(t) L(t)^\dagger}{\mathrm{Tr}(L(t) L(t)^\dagger)}
+\label{eq:cholesky}
 \end{equation}
-
-is therefore one member of a stationary manifold rather than a unique fixed point.
-
-\section{Constraint-Preserving Neural Architecture}
-
-\subsection{Architecture Overview}
-
-Instead of directly predicting the entries of $\rho$, the network predicts parameters defining an auxiliary matrix $A(t)$.
-
-The density matrix is then constructed as
-
+where $L(t)$ is a lower-triangular complex matrix output by the network. This guarantees Hermiticity, positivity, and unit trace by construction at every $t$. The training loss is
 \begin{equation}
-\rho(t)
-=
-\frac{A(t)A^\dagger(t)}
-{\mathrm{Tr}(A(t)A^\dagger(t))}
-\label{gram}
+\mathcal{L} = \mathbb{E}_{t \sim \mathcal{T}}\left\| \frac{d\rho}{dt} - \mathcal{D}[\rho] \right\|_F^2 + \lambda_{\mathrm{IC}} \left\| \rho(0) - \rho_{\mathrm{target}} \right\|_F^2,
+\label{eq:cholesky-loss}
 \end{equation}
+where $\mathcal{T}$ is a finite set of collocation points and $\mathcal{D}[\rho]$ is the Lindblad right-hand side. The IC term is a soft penalty with weight $\lambda_{\mathrm{IC}}$ (default 10). The prior paper reported that this setup recovers the analytic trajectory on the 1-qubit pure-dephasing problem with $T = 5$ to within a few percent Frobenius error.
 
-This construction guarantees
+\subsection{Experimental protocol}
+\label{sec:protocol}
 
+All experiments in this paper share the protocol below, with deviations noted explicitly per table. Code and run manifests are in the companion repository (see Section~\ref{sec:availability}).
+
+\paragraph{Architecture.}
+Network is a multilayer perceptron (MLP) with tanh activations. Hidden widths and depths are scaled with Hilbert dimension to keep parameter count proportional:
 \begin{itemize}
-\item Hermiticity
-\item Positive semidefiniteness
-\item Unit trace
+\item 1 qubit ($d=2$): hidden dim $64$, 3 layers
+\item 2 qubits ($d=4$): hidden dim $128$, 4 layers
+\item 3 qubits ($d=8$): hidden dim $192$, 4 layers (reduced from the originally planned $256/5$ for compute)
+\item 4 qubits ($d=16$): hidden dim $384$, 5 layers (built and unit-tested; not run end-to-end)
 \end{itemize}
 
-because $AA^\dagger$ is a Gram matrix.
+\paragraph{Optimization.}
+Adam optimizer with learning rate $10^{-3}$ throughout. 30{,}000 epochs per run. No learning-rate schedule beyond the curriculum (curriculum stages each use $n_{\mathrm{epochs}} / n_{\mathrm{stages}}$ epochs, sharing a single Adam state across stages).
 
-\paragraph{Theorem.}
-For any complex matrix $A(t)$ with $\mathrm{Tr}(A(t)A^\dagger(t))>0$, the matrix defined in Eq.~(\ref{gram}) is Hermitian, positive semidefinite, and trace normalized.
+\paragraph{Collocation grid.}
+200 uniform points on $[0, T]$ for 1-qubit and 2-qubit closed-system runs; 100 points for the 3-qubit run for compute tractability (see Section~\ref{sec:limitations} on this caveat).
 
-\paragraph{Proof.}
-$A(t)A^\dagger(t)$ is Hermitian and positive semidefinite as a Gram matrix. Division by the positive real scalar $\mathrm{Tr}(A(t)A^\dagger(t))$ preserves both properties and enforces unit trace.
+\paragraph{Curriculum stages.}
+$\{1.0, 2.0, 5.0, 10.0, 25.0\}$ in time-units of $T$, applied wherever curriculum is on. Each stage uses $n_{\mathrm{epochs}}/5 = 6000$ epochs. The model from stage $i$ warm-starts stage $i+1$; the optimizer state (Adam moments) is preserved across stages.
 
-\subsection{Parameterization}
+\paragraph{Seeds.}
+1-qubit closed-system + curriculum: 10-seed sweep (\texttt{base\_seed = 2001..2010}), run on CPU due to a transient GPU-build incompatibility on the available hardware (functionally equivalent on this network size). 2-qubit and 3-qubit closed-system + curriculum: multi-seed sweeps (2q even-split, \texttt{base\_seed = 2001..2010}, $n = 10$; 3q with per-stage LR restart, \texttt{base\_seed = 2001..2005}, $n = 5$). All three sweeps supply the variance characterization in Section~\ref{sec:limitations}; Table~\ref{tab:headline} reports the single-seed \texttt{base\_seed = 2001} value per size, which for 2q/3q is a favorable draw (see Section~\ref{sec:limitations}).
 
-We define
+\paragraph{Hardware.}
+NVIDIA RTX 5070 (12~GB) for all runs. Closed-system 1-qubit and 2-qubit runs complete in $\sim 30$ minutes each; the 3-qubit run takes $\sim 6$ hours.
 
-\begin{equation}
-A(t)
-=
-\begin{pmatrix}
-e^{\alpha_1(t)} & 0 \\
-\beta(t)+i\gamma(t) & e^{\alpha_2(t)}
-\end{pmatrix}
-\label{paramA}
-\end{equation}
+\section{The Local-vs-Global Gap}
 
-The neural network predicts the real functions
+\subsection{Setup and observation}
 
-\[
-\alpha_1(t),\alpha_2(t),\beta(t),\gamma(t)
-\]
+We retrained the constraint-preserving PINN of Eq.~(\ref{eq:cholesky}) on a closed-system 1-qubit task with $H = \sigma_z$ and IC $|+\rangle\langle+|$ on $t \in [0, 25]$, using identical optimization settings to the prior work ($\mathrm{Adam}$, $\mathrm{LR} = 10^{-3}$, 200 collocation points, hidden dim 64, 3 layers, 30{,}000 epochs).
 
-This parameterization represents a log-Cholesky form which fixes gauge freedom under transformations $A \rightarrow AU$ for unitary $U$.
-While Gram matrix and Cholesky-style constructions are standard tools for enforcing positive semidefiniteness \cite{horn1990}, our contribution is to integrate this constraint-preserving representation directly into a PINN for Lindblad quantum dynamics.
+The trained model reached $\mathcal{L}_{\mathrm{phys}} = 2.4 \times 10^{-3}$, comparable to the prior paper's converged loss. The trajectory error against the analytic solution, however, was $1.02$ in the maximum Frobenius distance $\max_t \| \rho_{\mathrm{model}}(t) - \rho_{\mathrm{analytic}}(t) \|_F$ over $t \in [0, 25]$. Repeating the experiment at 2 qubits ($d=4$, $H = \omega_1 \sigma_z^{(1)} + \omega_2 \sigma_z^{(2)} + J(\sigma_x^{(1)} \sigma_x^{(2)} + \sigma_y^{(1)} \sigma_y^{(2)})$, $\mathrm{IC} = |+0\rangle\langle+0|$) gave $\mathcal{L}_{\mathrm{phys}} = 3.5 \times 10^{-4}$ and Frobenius trajectory error $1.03$. \emph{The physics loss is small but the trajectory is wrong}.
 
-\subsection{Training Objective}
+We report two trajectory-error metrics in what follows. \textbf{Test A} is the self-consistency error against the analytic propagator applied to the model's own initial state, $\max_t \| \rho_{\mathrm{model}}(t) - U(t) \rho_{\mathrm{model}}(0) U(t)^\dagger \|_F$, which isolates the learned dynamics independent of any IC drift. \textbf{Test B} is the target-match error $\max_t \| \rho_{\mathrm{model}}(t) - U(t) \rho_{\mathrm{target}} U(t)^\dagger \|_F$, which folds in IC drift. The two coincide when $\rho_{\mathrm{model}}(0) = \rho_{\mathrm{target}}$ (the case under structural IC anchoring); they diverge when the model's IC has drifted, as happens for the cholesky parameterization at 1 qubit (Section~\ref{sec:ablation}).
 
-The model minimizes the Frobenius norm of the Lindblad residual
+We call this the \textbf{local-vs-global gap}: the residual is checked at a finite set of $N$ collocation timestamps, and the trained model is empirically a member of a family that satisfies the residual at those $N$ points while drifting from the analytic solution between them. Figure~\ref{fig:gap} illustrates this for the 1-qubit closed-system case: the model's $\langle \sigma_x \rangle(t)$ tracks the analytic prediction at small $t$ but drifts with growing amplitude error. We do not prove that the wrong-but-smooth family is in general non-trivial; we only observe that the gradient-descent trajectory lands in it for the problems studied here.
 
-\begin{equation}
-\mathcal{L}_{\mathrm{phys}}
-=
-\left\|
-\frac{d\rho}{dt}
--
-\mathcal{D}[\rho]
-\right\|_F^2
-\label{physloss}
-\end{equation}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{figures/fig1_gap_demonstration.pdf}
+\caption{Local-vs-global gap on a 1-qubit closed-system task ($H = \sigma_z$, $\mathrm{IC} = |+\rangle\langle+|$, $T = 25$). The trained PINN reaches physics loss $2.4 \times 10^{-3}$ at 30{,}000 epochs but the predicted $\langle\sigma_x\rangle(t)$ drifts from the analytic solution by O(1) in amplitude over the training interval.}
+\label{fig:gap}
+\end{figure}
 
-where $\mathcal{D}[\rho]$ denotes the Lindblad generator defined in Eq.~(\ref{lindblad}).
+\subsection{The gap is dimension-independent}
+\label{sec:dim-indep}
 
-A weak entropy regularization term is also used
+To isolate whether the gap is amplified by Hilbert-space dimension, we ran matched experiments at 1 and 2 qubits with identical training protocol and observed nearly identical maximum trajectory error (1.02 vs.\ 1.03). The gap is not a multi-qubit pathology---it is a feature of the loss formulation that appears whenever the time interval is long enough that the wrong-but-smooth family becomes large.
 
-\begin{equation}
-\mathcal{L}
-=
-\mathcal{L}_{\mathrm{phys}}
-+
-\lambda \,
-\mathrm{Var}_{t \in T}
-\left(
-S(\rho(t))
-\right)
-\label{totalloss}
-\end{equation}
+\subsection{Six unsuccessful loss modifications}
 
-where
-
-\begin{equation}
-S(\rho) = -\mathrm{Tr}(\rho \log \rho)
-\label{entropy}
-\end{equation}
-
-is the von Neumann entropy and the variance is computed across the discrete training time grid $T$.
-Empirically, this term reduced convergence to nearly stationary solutions and improved training stability in our experiments.
-
-\subsection{Baseline Loss}
-
-The baseline PINN uses direct prediction of density matrix entries with penalty terms enforcing constraints:
-\begin{equation}
-\mathcal{L}_{\mathrm{base}} =
-\left\|\frac{d\rho}{dt} - \mathcal{D}[\rho]\right\|_F^2
-+ \lambda_{\mathrm{H}}\|\rho-\rho^\dagger\|_F^2
-+ \lambda_{\mathrm{T}}(\mathrm{Tr}(\rho)-1)^2
-+ \lambda_{\mathrm{P}}\Phi(\rho).
-\label{baseloss}
-\end{equation}
-The baseline PINN follows the standard penalty-based formulation used in prior physics-informed neural network approaches \cite{raissi2019,bondesan2022}. Here $\Phi(\rho)$ denotes a positivity penalty constructed from the negative part of the eigenvalue spectrum of $\rho$, and $\lambda_{\mathrm{H}},\lambda_{\mathrm{T}},\lambda_{\mathrm{P}}$ are tuned on validation runs.
-
-\section{Experimental Setup}
-
-We consider a single-qubit pure dephasing model with
-\[
-H = \omega \sigma_z,
-\qquad
-L = \sqrt{\gamma}\,\sigma_z,
-\qquad
-\rho(0) = |+\rangle\langle+|.
-\]
-Under this model the populations remain constant while the coherences decay exponentially.
-
-Training used a four-layer multilayer perceptron with Tanh activations.
-Physical time $\tau \in [0,T]$ is linearly mapped to a normalized network input
-$t \in [-1,1]$; reported times refer to the physical scale $\tau$.
-\begin{equation}
-t = \frac{2\tau}{T} - 1
-\label{timemap}
-\end{equation}
-
-Optimization was performed using Adam for 5000 epochs.
+We tested six modifications to the loss, each motivated by a different hypothesis about the gap's source. Table~\ref{tab:six-failed} summarizes results.
 
 \begin{table}[H]
 \centering
-\begin{tabular}{lll}
+\begin{tabular}{p{0.30\linewidth}p{0.40\linewidth}p{0.20\linewidth}}
 \toprule
-Parameter & Baseline PINN & Constraint-preserving PINN \\
+Modification & Hypothesis & 1q traj\_max \\
 \midrule
-Architecture & 4 layer MLP & 4 layer MLP \\
-Activation & Tanh & Tanh \\
-Outputs & 8 matrix entries & 4 parameters \\
-Epochs & 5000 & 5000 \\
-Optimizer & Adam & Adam \\
-Trials & 100 & 100 \\
+Baseline (no modification) & --- & 1.02 \\
+Semigroup loss $\|U(a+b)-U(a)U(b)\|^2$ & multiplicative constraint at all $(a,b)$ & 1.37 (worse) \\
+Terminal pin $\|\rho(T)-\rho_{\mathrm{ana}}(T)\|^2$ & pin global endpoint & 1.38 (endpoint fixed; middle worse) \\
+Supervised regression at collocation pts & directly fit analytic & 1.24 (gauge freedom in $U$) \\
+Augmented Lagrangian on residuals & hard constraints via duals & 1.04 (schedule overshoot) \\
+Chebyshev-basis network (no MLP) & remove MLP optimization geometry & 1.35 \\
+Reweight $\lambda_{\mathrm{IC}}$ to $100$/$1000$ & overcome IC drift & no improvement \\
 \bottomrule
 \end{tabular}
-\caption{Training configuration}
-\label{tab:training}
+\caption{Loss-modification ablation at 1 qubit, 30{,}000 epochs, $T = 25$. None close the gap.}
+\label{tab:six-failed}
 \end{table}
 
-\section{Success Criteria}
+The pattern is consistent: changes to the loss formulation that add more constraints either (a) introduce manifolds of zero-loss solutions, (b) pin one point well at the cost of the rest of the trajectory, or (c) overshoot via schedule sensitivity. The gap is not a loss-side problem.
 
-A training run was classified as successful if
+\section{What Closes the Gap}
 
-\begin{enumerate}
-\item Trace error $|\mathrm{Tr}(\rho)-1| < 10^{-12}$
-\item Minimum eigenvalue $\ge -10^{-10}$
-\item Final Lindblad residual $< 10^{-5}$
-\end{enumerate}
+Two changes \emph{together} close the gap consistently across qubit count.
 
-\section{Results}
+\subsection{Structural extension of the architecture: unitary parameterization}
 
-Across 100 independent random seeds:
+The Eq.~(\ref{eq:cholesky}) parameterization preserves Hermiticity, positivity, and trace at each $t$ but does \emph{not} preserve unitarity (the matrix at $t_1$ and $t_2$ need not be unitarily related) and does not structurally pin the initial condition (the IC is a soft loss term). For closed-system dynamics we add both:
+\begin{equation}
+\rho(t) = U(t) \rho_0 U(t)^\dagger, \quad U(t) = \exp(-i A(t)), \quad A(t) = (t - t_{\min}) \cdot A_{\mathrm{raw}}(t),
+\label{eq:unitary}
+\end{equation}
+where $A_{\mathrm{raw}}(t)$ is a Hermitian-valued network output and the $(t - t_{\min})$ boundary factor forces $A(t_{\min}) = 0$, hence $U(t_{\min}) = I$, hence $\rho(t_{\min}) = \rho_0$ \emph{exactly}. The matrix exponential of an anti-Hermitian generator is unitary by construction, so purity is preserved.
+
+This adds two structural guarantees on top of the original three: the IC is exact (no soft anchor needed), and the trajectory is unitarily related at every pair of times. The only remaining quantity the network must learn is the dynamical generator $A_{\mathrm{raw}}$.
+
+\subsection{Time-marching curriculum}
+
+Instead of training on the full interval $[0, T]$ from random initialization, we train sequentially:
+\begin{equation}
+[0, t_1] \to [0, t_2] \to \cdots \to [0, T], \quad t_1 < t_2 < \cdots < T,
+\label{eq:curriculum}
+\end{equation}
+where each stage warm-starts from the previous stage's weights and uses $n_{\mathrm{epochs}} / n_{\mathrm{stages}}$ epochs. We use stages $\{1, 2, 5, 10, 25\}$ throughout. On a short interval the wrong-but-smooth family is smaller (fewer oscillation cycles for the trajectory to hide in) and the optimizer is dragged toward the analytic solution; extending the interval is a small perturbation that keeps the model near that solution. Figure~\ref{fig:curriculum} shows the loss trajectory across the five stages for the 1-qubit case: each stage transition lowers the achievable loss floor as the optimizer's warm-started state is progressively refined.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{figures/fig2_curriculum_convergence.pdf}
+\caption{Loss versus epoch for the 1-qubit closed-system task with time-marching curriculum (stages $\{1, 2, 5, 10, 25\}$ in $T$). Dotted vertical lines mark stage transitions. Each transition extends the training interval and refines a near-correct solution rather than searching from random initialization.}
+\label{fig:curriculum}
+\end{figure}
+
+\subsection{Headline results}
+
+Table~\ref{tab:headline} reports the 1-, 2-, and 3-qubit results with the structural unitary architecture (Eq.~\ref{eq:unitary}) and time-marching curriculum (Eq.~\ref{eq:curriculum}).
 
 \begin{table}[H]
 \centering
-\begin{tabular}{lcc}
+\begin{tabular}{lccc}
 \toprule
-Metric & Baseline PINN & Constraint-preserving PINN \\
+Setup & $\rho(0)$ Frobenius err & Test A max traj err & Final loss \\
 \midrule
-Success rate & 67\% & 99\% \\
-Max trace error & $10^{-7}$ & $<10^{-15}$ \\
-Negative eigenvalues & Observed in failed runs & None \\
-Training stability & frequent failed runs & stable across seeds \\
+1q closed unitary + curriculum & $0.0$ & $\mathbf{5.5 \times 10^{-3}}$ & $\mathbf{1.0 \times 10^{-6}}$ \\
+2q closed unitary + curriculum & $0.0$ & $5.2 \times 10^{-2}$ \, (1 seed) & $\sim 0$ \\
+3q closed unitary + curriculum & $0.0$ & $1.7 \times 10^{-3}$ \, (1 seed) & $7.5 \times 10^{-8}$ \\
 \bottomrule
 \end{tabular}
-\caption{Training outcomes across trials}
-\label{tab:results}
+\caption{Headline results with structural unitary architecture + time-marching curriculum. Test A = $\max_t \| \rho_{\mathrm{model}}(t) - U(t) \rho_{\mathrm{model}}(0) U(t)^\dagger \|_F$, computed against the analytic propagator built from the same $H$. All runs: $T = 25$, 30{,}000 epochs, 200 collocation points (100 at 3q for compute tractability). The 1q value is the $n = 10$ median; the 2q and 3q values are single-seed (\texttt{base\_seed = 2001}) and are favorable draws---multi-seed, the plain combination is high-variance at 2--3 qubits and reliable closure requires the per-stage learning-rate restart (2q 6/8, 3q 5/5). See Section~\ref{sec:limitations}.}
+\label{tab:headline}
 \end{table}
 
-\section{Spectral Bias Analysis}
-
-To characterize frequency-dependent learning behavior, we performed a spectral analysis of the learned density-matrix trajectories.
-We computed Fourier-domain errors between each model's predicted $\rho(t)$ and a numerical Lindblad reference solution under the same Hamiltonian and dissipator.
-For each configuration we tracked low- and high-frequency error components across training epochs.
-This analysis follows the spectral-bias framework that shows neural networks tend to learn low-frequency components faster than high-frequency components \cite{rahaman2019,xu2018}.
-
-Figure~\ref{fig:spectral_error} shows that both the baseline and constraint-preserving PINN exhibit a pronounced low-frequency learning advantage: low-frequency error decreases rapidly while high-frequency error decays more slowly.
-Increasing depth and width changes absolute error levels but does not eliminate the bias.
-Figure~\ref{fig:spectral_spectrum} compares the final learned spectra to the Lindblad reference, highlighting residual high-frequency discrepancies even when fidelity is high.
+Compared to the unitary architecture without curriculum (1q traj err 1.02, 2q 1.03), the 1q reduction is $\sim 180\times$ (median across $n = 10$ seeds; 9 of 10 in 145--210$\times$, one seed at 54$\times$ reduction still decreasing at the 30{,}000-epoch budget; see Figure~\ref{fig:seed-variance} and Section~\ref{sec:limitations}). The 2q and 3q single-seed reductions ($\sim 20\times$ and $\sim 600\times$) are favorable draws; multi-seed, the plain combination is high-variance (2q 3/10 in-basin) and reliable closure requires the per-stage restart (2q 6/8; 3q 5/5, median $4.0\times10^{-3}$, i.e.\ $\sim\!250\times$)---see Section~\ref{sec:limitations}. The closure does \emph{not} attenuate with qubit count: with the restart, all counts reach the correct basin two to three orders of magnitude below the no-curriculum baseline, and 3q is the tightest multi-seed set. (An earlier draft reported a $\sim 4\times$ 3q closure; that figure was an evaluation-Hamiltonian artifact, corrected here---see Section~\ref{sec:limitations}.) Figure~\ref{fig:scaling} plots the qubit-scaling curve against the no-curriculum baseline (Frobenius trajectory error $\sim 1.0$ at every qubit count we tested).
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.9\linewidth]{figures/spectral_bias/spectral_error_comparison.png}
-\caption{Low- and high-frequency error components during training for baseline and constraint-preserving PINNs (2x2 system). Both exhibit spectral bias: low-frequency error collapses faster than high-frequency error.}
-\label{fig:spectral_error}
+\includegraphics[width=0.7\linewidth]{figures/fig4_qubit_scaling.pdf}
+\caption{Qubit-scaling of curriculum closure. Each point is a 30{,}000-epoch unitary-architecture run with $T = 25$ and curriculum stages $\{1, 2, 5, 10, 25\}$. Horizontal dashed line: no-curriculum baseline trajectory error (approximately constant across qubit count per Section~\ref{sec:dim-indep}). Curriculum closure holds across every qubit count tested (1--3), two to three orders of magnitude below the baseline, with no monotone attenuation with Hilbert dimension.}
+\label{fig:scaling}
 \end{figure}
+
+\section{Ablation: which piece does the work}
+\label{sec:ablation}
+
+Table~\ref{tab:ablation} reports the architecture $\times$ training cross at both 1 and 2 qubits.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llccc}
+\toprule
+System & Setup & IC error & Test A max traj err & Final loss \\
+\midrule
+1q closed & Cholesky, no curriculum & $0.99$ & $0.91$ & $3.7 \times 10^{-3}$ \\
+1q closed & Cholesky + curriculum    & $0.99$ & $0.87$ & $2.4 \times 10^{-3}$ \\
+1q closed & Unitary, no curriculum   & $0.0$  & $1.02$ & $2.4 \times 10^{-3}$ \\
+1q closed & \textbf{Unitary + curriculum} & $\mathbf{0.0}$  & $\mathbf{5.5 \times 10^{-3}}$ & $\mathbf{1.0 \times 10^{-6}}$ \\
+\midrule
+2q closed & Cholesky, no curriculum & $1.9 \times 10^{-3}$ & $0.79$ & $4.3 \times 10^{-4}$ \\
+2q closed & Cholesky + curriculum    & $1.6 \times 10^{-3}$ & $0.99$ (worse) & $4.8 \times 10^{-4}$ \\
+2q closed & Unitary, no curriculum   & $0.0$ & $1.03$ & $3.5 \times 10^{-4}$ \\
+2q closed & \textbf{Unitary + curriculum} & $\mathbf{0.0}$ & $\mathbf{5.2 \times 10^{-2}}$ & $\mathbf{\sim 0}$ \\
+\bottomrule
+\end{tabular}
+\caption{Architecture $\times$ training ablation. Only unitary + curriculum closes the gap at both qubit counts.}
+\label{tab:ablation}
+\end{table}
 
 \begin{figure}[H]
 \centering
-\begin{minipage}{0.48\linewidth}
-\centering
-\includegraphics[width=\linewidth]{figures/spectral_bias/baseline_d4_w128_spectrum_comparison.png}
-\caption*{Baseline PINN}
-\end{minipage}
-\hfill
-\begin{minipage}{0.48\linewidth}
-\centering
-\includegraphics[width=\linewidth]{figures/spectral_bias/physics_d4_w128_spectrum_comparison.png}
-\caption*{Constraint-preserving PINN}
-\end{minipage}
-\caption{Fourier magnitude spectra of density-matrix elements at final epoch versus the Lindblad reference for depth-4, width-128 models. High-frequency discrepancies persist even when overall fidelity is strong.}
-\label{fig:spectral_spectrum}
+\includegraphics[width=0.85\linewidth]{figures/fig3_ablation_bars.pdf}
+\caption{Architecture $\times$ training ablation visualization. Bars are Test A maximum trajectory error (log scale) for each of the four setups at 1 and 2 qubits. Dotted line at $1.0$ marks the no-curriculum baseline regime. Only the unitary + curriculum combination drops two orders of magnitude below the baseline at both qubit counts.}
+\label{fig:ablation}
 \end{figure}
 
-\section{Gradient Pathology Diagnostics}
+Three observations:
 
-We also quantified gradient imbalances across the composite loss terms that arise in penalty-based PINNs.
-This follows prior work showing that stiff gradient flow can cause unbalanced gradients between physics residuals and constraint terms, destabilizing training \cite{wang2020gradient}.
-Figure~\ref{fig:grad_pathology} shows per-term gradient norms for the baseline and constraint-preserving PINN.
-In the baseline model, constraint penalties and physics residuals can differ by orders of magnitude, while the constraint-preserving PINN exhibits a simpler gradient structure dominated by the physics residual.
+\paragraph{Cholesky's soft IC anchor is irregular.}
+At 1 qubit the cholesky model fails to anchor the IC ($\|\rho(0) - \rho_{\mathrm{target}}\|_F = 0.99$); at 2 qubits the same anchor works ($1.6 \times 10^{-3}$). The soft anchor's success depends on the relative gradient scales of the IC and physics losses, which depend on the problem. The structural anchor of Eq.~(\ref{eq:unitary}) is exact by construction at every problem scale.
+
+\paragraph{Curriculum alone does not robustly help cholesky.}
+At 1 qubit the curriculum improves cholesky's trajectory error from $0.91$ to $0.87$ (marginal). At 2 qubits the same curriculum makes cholesky \emph{worse} ($0.79 \to 0.99$). The warm-start trick relies on the architecture's hypothesis space being narrow enough that the short-interval solution has a unique extension; cholesky's full flexibility in $\rho(t)$ at each $t$ violates this.
+
+\paragraph{Unitary alone does not close the gap either.}
+The unitary architecture without curriculum has the same $\sim 1.0$ trajectory error as cholesky-no-curriculum. Structural constraints rule out invalid states but do not rule out wrong-but-smooth states.
+
+Only the combination of structural unitary architecture \emph{and} time-marching curriculum closes the gap across both qubit counts.
+
+\section{The Original Result Holds Up}
+
+A natural concern: does the local-vs-global gap invalidate the prior constraint-preserving result~\cite{hangen2024constraint}? It does not. Re-running the original setup ($H = \sigma_y$, $L = \sigma_x$ with $\gamma = 1$ implicit, $\mathrm{IC} = |0\rangle\langle 0|$, $T = 5$, 30{,}000 epochs) reproduces a substantively correct result:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lc}
+\toprule
+Metric & Value \\
+\midrule
+Final physics loss & $8.6 \times 10^{-3}$ \\
+$\rho(0)$ Frobenius error & $3.8 \times 10^{-2}$ \\
+Trajectory error max (Test B) & $\mathbf{8.8 \times 10^{-2}}$ \\
+Trajectory error mean & $2.0 \times 10^{-2}$ \\
+Trajectory error at $t = T$ & $7.9 \times 10^{-3}$ \\
+\bottomrule
+\end{tabular}
+\caption{Reproduction of the original constraint-preserving 1-qubit Lindblad result.}
+\label{tab:foundation}
+\end{table}
 
 \begin{figure}[H]
 \centering
-\begin{minipage}{0.48\linewidth}
-\centering
-\includegraphics[width=\linewidth]{figures/spectral_bias/baseline_d4_w128_gradient_norms.png}
-\caption*{Baseline PINN}
-\end{minipage}
-\hfill
-\begin{minipage}{0.48\linewidth}
-\centering
-\includegraphics[width=\linewidth]{figures/spectral_bias/physics_d4_w128_gradient_norms.png}
-\caption*{Constraint-preserving PINN}
-\end{minipage}
-\caption{Gradient norms by loss term for depth-4, width-128 models. Baseline training shows multi-term gradient imbalance; the constraint-preserving model reduces competing gradient scales.}
-\label{fig:grad_pathology}
+\includegraphics[width=0.85\linewidth]{figures/fig5_foundation_reproducibility.pdf}
+\caption{Foundation reproduction: cholesky-architecture PINN trained on the original 1-qubit Lindblad problem ($H = \sigma_y$, $L = \sigma_x$ with $\gamma = 1$ implicit, $\mathrm{IC} = |0\rangle\langle 0|$, $T = 5$). The model's population $\rho_{00}(t)$ and coherence $|\rho_{01}(t)|$ track the analytic Lindblad solution within $\sim 6$--$9\%$ Frobenius error.}
+\label{fig:foundation}
 \end{figure}
 
-\section{Depth Sweep}
+The 6-9\% Frobenius trajectory error is consistent with the prior paper's reported performance. The local-vs-global gap does \emph{not} reproduce because (i) the time interval is short ($T = 5$, one or two oscillation cycles), (ii) the open-system dynamics decays toward a stationary distribution which is geometrically simpler than sustained oscillation, and (iii) at this scale the cholesky soft IC anchor is sufficient.
 
-Motivated by evidence that deep PINNs can degrade without architectural modifications \cite{jiang2025deeperpinns}, we performed a refined depth sweep (3000 epochs, 600 time points, three seeds per depth) using the constraint-preserving architecture. Depth increases consistently reduced the final loss but produced only marginal changes in mean fidelity, indicating that depth alone does not resolve the remaining accuracy gap. Figure~\ref{fig:depth_sweep_fidelity} summarizes fidelity versus depth for the refined sweep.
+The local-vs-global gap is therefore a \emph{scaling effect}: it emerges when the time interval is extended and the dynamics become sustained-oscillatory (closed-system or weakly-damped). The prior paper's claim stands on the problem it studied. The current paper extends the methodology to a regime where the original recipe is insufficient and shows what fix is required.
+
+\section{Open Systems: Curriculum Does Not Transfer to Kraus}
+\label{sec:openkraus}
+
+For open systems ($\gamma > 0$) we extended the unitary architecture to a Kraus-operator representation via Stinespring dilation: parameterize an isometry $V: \mathbb{C}^d \to \mathbb{C}^{Nd}$ (the first $d$ columns of a unitary on the dilated space) and extract Kraus operators $\{K_\alpha\}_{\alpha = 1 \ldots N}$ as $d$-row blocks of $V$. The CPTP map $\rho(t) = \sum_\alpha K_\alpha(t) \rho_0 K_\alpha(t)^\dagger$ is structurally trace-preserving, positivity-preserving, and IC-anchored (via the same $(t - t_{\min})$ boundary factor on the dilated generator).
+
+Applied to the 1-qubit amplitude-damping plus pure-dephasing problem ($\gamma_{\mathrm{amp}} = 0.05$, $\gamma_{\mathrm{phase}} = 0.02$, $T = 25$, curriculum stages $\{1, 2, 5, 10, 25\}$), the architecture preserves CPTP to machine precision ($\| \rho - \rho^\dagger \|_F < 10^{-8}$, $\min \mathrm{eig}(\rho) = 0$) but fails to close the trajectory gap: final physics loss $2.9 \times 10^{-4}$ with max trajectory error $1.36$ against the analytic Lindblad solution. The curriculum methodology that closes the closed-system gap does not transfer.
+
+We attribute this to the qualitatively different geometry of open-system trajectories: closed-system dynamics is sustained oscillation, well-approximated locally near $t = 0$ by a low-order Taylor series that the curriculum can warm-start from; open-system dynamics is exponential decay toward a steady state, with qualitatively different short-$t$ and long-$t$ behavior. A short-interval warm start does not capture the dissipative tail. Open-system PINN training methodology is therefore a separate problem from closed-system PINN training methodology; we sketch candidate fixes in Section~\ref{sec:limitations}.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\paragraph{4-qubit experiment: first data point.}
+The 4-qubit ($16\times16$) closed-system run is computationally heavy---the autograd backward through the $256 \times 256$ matrix exponential is the cost driver, and one 30{,}000-epoch run at 100 collocation points took $\sim 35$ hours on a single RTX 5070. (It is also CPU-feed-bound: GPU throughput collapses if the host cores are saturated by concurrent jobs, so a 4q run should not be co-scheduled with a full-core CPU sweep.) We report a single seed. With the unitary architecture + curriculum + per-stage LR restart it reaches the correct basin---max Test-A trajectory error $9.7\times10^{-4}$ ($\rho(0)$ exact, ``dynamics and IC correct'')---comparable to, and in fact tighter than, the 1--3 qubit closures. So the closure extends cleanly across the full ladder we tested (1--4 qubits) with no attenuation. A multi-seed 4-qubit characterization remains future work on the compute budget, as does the next rung (5 qubits, $32\times32$), whose larger frequency content may require denser collocation.
+
+\paragraph{3-qubit collocation density.}
+The $0.25$ 3-qubit figure in Table~\ref{tab:headline} was found to be an \emph{evaluation artifact}, not a physical result: the 3-qubit trajectory evaluator built a different coupling Hamiltonian (an $XX_{12}+YY_{23}+ZZ_{13}$ triangle) than the trainer's nearest-neighbour $XX{+}YY$ chain ($XX_{12}+YY_{12}+XX_{23}+YY_{23}$), so the model was scored against a propagator it never trained on. Re-evaluated against the matching Hamiltonian, the same 3-qubit curriculum run reaches $\sim\!1.7\times10^{-3}$ (the correct basin), comparable to 1 and 2 qubits. The apparent degradation of closure with qubit count ($180\times \to 20\times \to 4\times$) was therefore largely this artifact, not intrinsic difficulty; collocation density at 3 qubits is a secondary effect (matched 200-point collocation moves the corrected error only from $\sim\!3\times10^{-3}$ to $\sim\!1\times10^{-3}$). The headline table, the qubit-scaling figure, and the scaling discussion above have been regenerated against the corrected evaluator and now report the corrected $1.7\times10^{-3}$ value. A regression test (\texttt{test\_eval\_hamiltonian\_matches\_trainer}) now pins the evaluator Hamiltonian to the trainer's at 3 and 4 qubits to prevent recurrence.
+
+\paragraph{Open-system Kraus methodology.}
+The curriculum does not close the open-system gap. We identify $\gamma$-curricula (start at $\gamma = 0$ and ramp), steady-state anchoring (add $\|\rho(T \to \infty) - \rho_{\mathrm{steady}}\|^2$ to the loss), and supervised tail-matching as candidate fixes. None has been tested.
+
+\paragraph{Comparison to classical integrators.}
+We have not benchmarked PINN wall-clock training time against classical numerical integrators (e.g.\ RK4) on the same problems. The PINN value proposition is amortization across parameterized Hamiltonians and a learned continuous representation queryable at any $t$, not raw integration speed; making this explicit is necessary before claiming a practical advantage.
+
+\paragraph{Optimizer choice and training duration.}
+All results above use Adam. To test whether the residual gap between the curriculum result ($\sim 5 \times 10^{-3}$ max-Frobenius trajectory error at 1 qubit; Table~\ref{tab:headline}) and the analytic solution is limited by first-order optimization, we compared Adam against a second-order optimizer (L-BFGS with strong-Wolfe line search) on the same architecture and curriculum at \emph{matched wall-clock} on the same machine ($n = 3$ seeds). We find no optimizer advantage: at equal compute Adam reaches the correct basin on all three seeds, while L-BFGS is comparable on two and markedly worse on one, and is sensitive to the learning rate at curriculum-stage transitions (diverging or stalling for some seed/rate combinations). The residual gap is therefore not attributable to first-order optimization.
+
+These matched-budget Adam runs also expose a training-budget effect, which a checkpointed sweep then localized to the curriculum \emph{schedule} rather than the total budget. First, \emph{within} a single run the trajectory error decreases monotonically alongside the residual---there is no late-training drift away from the analytic solution. Second, and decisively, the converged basin is set by \emph{how the epoch budget is allocated across curriculum stages}: holding both the total ($30{,}000$ epochs) and the final-stage ($t_{\max}=25$) budget fixed and redistributing only the earlier stages, front-loading the shortest interval (e.g.\ $12{,}000$ of the $30{,}000$ epochs on the $t_{\max}=1$ stage) reaches the correct basin (max trajectory error below $10^{-3}$) on all four seeds tested, whereas an even split (max error $\sim 5\times10^{-3}$ to $10^{-2}$ across these seeds, in line with the even-split headline) and an early-light / intermediate-heavy split (max error $\sim 5\times10^{-2}$) both settle into the wrong-but-smooth basin. The lever for the residual gap is therefore the curriculum \emph{allocation}---a strong foundation on the shortest interval---not the optimizer, not the architecture, and not simply a larger or smaller total budget. The front-loaded $30{,}000$-epoch schedule is about an order of magnitude better than the even-split run in this sweep at the same total, so the reported even-split figure is conservative as a \emph{schedule}. A separate single-factor companion sweep (its own fixed total, with stage~2, stage~3, and the final stage all held constant, varying \emph{only} the shortest-stage $t_{\max}=1$ versus intermediate-stage $t_{\max}=10$ split) sharpens this: trajectory error degrades monotonically as epochs move from the shortest to the intermediate stage---a $7\text{k}/3\text{k}$ split reaches the correct basin on all four seeds, while $5\text{k}/5\text{k}$ and $3\text{k}/7\text{k}$ do not---so the controlling factor is this allocation split. We stop short of attributing it to shortest-stage starvation versus intermediate-stage excess in isolation, since at fixed total these are the same redistribution. The same allocation-dependence leaves the status of the slow outlier (seed 2004) ambiguous: its continued loss decrease is equally consistent with eventual convergence or with settling into a nearby suboptimal basin. We emphasize that this allocation effect is established only at 1 qubit: a 2-qubit screen ($n=3$ seeds) found that neither schedule reaches the correct basin, and the aggressive front-load instead \emph{destabilizes} training---the physics residual fails to converge for most seeds---so the front-loading prescription is problem-specific and we do not present it as a general curriculum recipe. A separate optimizer-side intervention, however, does move the 2-qubit case: rebuilding a fresh warmup$\rightarrow$cosine learning-rate schedule at each curriculum-stage boundary (so the final, longest-horizon stage trains at a live learning rate rather than the near-dead tail of a single full-budget cosine) reduces the even-split trajectory error from $\sim 5\times10^{-2}$ into the $10^{-3}$--$10^{-2}$ range. We sweep the per-stage warmup fraction over $\{0, 0.1, 0.3, 0.5, 0.7\}$ across 8 seeds. A sharp restart (instant re-warm, fraction $0$) destabilizes every seed (the residual fails to converge and the trajectory collapses to a maximally-wrong fixed point). A warmup fraction of $\approx\!30\%$ of each stage is the robust sweet spot: across all 8 seeds it never destabilized and reached the correct basin ($<5\times10^{-3}$) on 6 of 8 (the other two just above, $\sim\!6\times10^{-3}$). Stability is \emph{not} monotone in the warmup fraction, though---larger gentle fractions ($50\%$, $70\%$) reintroduce occasional per-seed blow-ups---and no single fraction places all 8 seeds in the correct basin, with the best fraction seed-dependent. The restart therefore \emph{narrows and stabilizes} the 2-qubit gap, best at a $\approx\!30\%$ warmup, without fully closing it. This indicates the 2-qubit gap is not allocation-closable but is substantially responsive to the per-stage learning-rate \emph{schedule}, a distinct axis from epoch allocation; the residual, seed-dependent variance is consistent with the identifiability picture, in which which residual-minimizing solution the optimizer reaches depends jointly on the seed and the schedule. (8-seed 2-qubit screen.) This per-stage-restart benefit \emph{extends} to 3 qubits: at 8$\times$8 (GHZ initial state, $\gamma=0$, even split, three seeds), the restart at the $\approx\!30\%$ fraction reaches the correct basin on all three seeds (max trajectory error $\sim\!1$--$4\times10^{-3}$ at 100 collocation points, $\sim\!1.2\times10^{-3}$ at 200), whereas the no-restart baseline reaches it on only one of the three (the other two at $\sim\!3\times10^{-2}$). The optimizer-side lever therefore transfers from 2 to 3 qubits, and the constraint-preserving curriculum methodology closes the local-vs-global gap across every qubit count tested.
+
+A complementary, purely \emph{structural} scaffold closes the 2-qubit gap more completely than any schedule lever, and---unlike the LR restart---it requires no analytic reference. Adding an auxiliary semigroup-composition penalty $\lVert U(t_1{+}t_2) - U(t_1)U(t_2)\rVert_F^2$ to the even-split loss (no per-stage restart) drives all 8 seeds into the correct basin (max trajectory error $\sim\!10^{-5}$ to $2\times10^{-3}$, seven of eight below $2\times10^{-4}$), versus $\sim\!5\times10^{-2}$ without it and $\sim\!3$--$7\times10^{-3}$ with the LR restart. The penalty uses only the model's own propagator: the sole operators satisfying the composition law for all $t$ are one-parameter groups $\exp(-iAt)$, so together with the physics residual (which fixes $A=H$) and the initial-condition anchor it uniquely selects the true propagator, deleting the wrong-but-smooth family that the pointwise residual at $N$ collocation points leaves under-determined. The effect has a sharp weight threshold: a 3-seed sweep of the penalty weight over $\{0.1, 0.3, 1.0, 3.0, 10.0\}$ closes the gap on all seeds at weight $\geq 1.0$ (median $\sim\!1.5$--$2.7\times10^{-5}$) but leaves it at the gap-floor below ($\sim\!6\times10^{-3}$ to $1.2\times10^{-2}$, 0/3), with no destabilization at the high end ($10\times$ is still 3/3 at $\sim\!1.5\times10^{-5}$)---so the $w=1.0$ used above is at the closure threshold and larger weights are safe. Stacking the scaffold ($w=1.0$) with the per-stage LR restart is the most reliable variant we find: on the matched 10-seed set it reaches the correct basin on \emph{all 10} (median $6.7\times10^{-5}$, every seed meeting the strict dynamics-and-IC criterion), tighter than the restart alone (8/10) or the scaffold alone (8/8). This identifies the residual gap concretely---it is exactly a failure of propagator composition---and the semigroup penalty as a direct, ground-truth-free remedy: the strongest 2-qubit lever we find. (Weight sweep: 3 seeds per weight; stack: 10-seed matched set.)
+
+\paragraph{Multi-seed characterization.}
+The 1-qubit closed-system + curriculum result is reported across 10 seeds (\texttt{base\_seed = 2001..2010}). Nine of ten seeds reach a max-Frobenius trajectory error in the range $4.87 \times 10^{-3}$ to $7.05 \times 10^{-3}$ (145$\times$ to 210$\times$ reduction vs.\ the no-curriculum baseline of 1.02), with a coefficient of variation of 13\% on max-trajectory error within this subset. The tenth seed (\texttt{seed = 2004}) reaches $1.88 \times 10^{-2}$ (54$\times$ reduction) at the 30{,}000-epoch budget. We report the median (177$\times$ over the 9-seed cluster, $\sim 180\times$ rounded) rather than the mean (144$\times$ over the full $n=10$ set) because seed 2004's incomplete convergence dominates the mean and is not representative of typical-case behavior at the reported training budget.
+
+Diagnostic per-stage analysis shows all ten seeds converge identically through curriculum stages 1--4 (final-stage entry loss within 1\% across seeds); the divergence emerges only in the final $t_{\mathrm{max}} = 25$ stage, where seed 2004's convergence rate is $\sim 3\times$ slower than the rest (Figure~\ref{fig:seed-variance}b). Seed 2004's loss is still actively decreasing at epoch 30{,}000 (last-1000-epoch window drops 9\%, not plateaued), consistent with continued convergence under a larger training budget; we have not confirmed that it reaches the same basin as the other nine seeds. The 1q recipe is therefore robust on this dataset (rapid convergence in 9 of 10 seeds at the standard budget); whether seed 2004 represents a slow approach to the same minimum or convergence toward a nearby suboptimal basin is an open question that an extended-budget rerun would resolve.
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.75\linewidth]{figures/depth_sweep_refined/depth_sweep_refined_fidelity.png}
-\caption{Mean fidelity versus depth for the refined sweep (3 seeds per depth, 3000 epochs, 600 time points). Fidelity plateaus across depths despite lower final losses at higher depth.}
-\label{fig:depth_sweep_fidelity}
+\includegraphics[width=0.95\linewidth]{figures/fig6_seed_variance.pdf}
+\caption{Multi-seed characterization of the 1q closed-system + curriculum result. \textbf{(a)} Per-seed max-Frobenius trajectory error across $n = 10$ seeds. Nine seeds cluster tightly near the median; \texttt{seed = 2004} (red) is the outlier, still decreasing at the 30{,}000-epoch budget. Dashed line: Cholesky no-curriculum baseline (1.02). \textbf{(b)} Loss history for the outlier seed (2004) and a typical seed (2009) on curriculum stages 4--5. Both seeds are essentially identical through stage 4 (epochs 18{,}000--24{,}000); divergence emerges only in the final $t_{\mathrm{max}} = 25$ stage.}
+\label{fig:seed-variance}
 \end{figure}
 
-\section{Architecture-Constrained Precedent}
+The single-seed 2- and 3-qubit headline values are favorable draws, not typical-case results; multi-seed sweeps (now unblocked, after the RTX 5070 Blackwell \texttt{sm\_120} PyTorch-\texttt{cu128} upgrade) show the plain unitary+curriculum combination is high-variance seed-to-seed at these sizes, and that reliable closure requires the per-stage learning-rate restart. At 2 qubits, the plain even-split combination across $n = 10$ seeds (\texttt{base\_seed = 2001..2010}) reaches the correct basin (max trajectory error $< 5\times10^{-3}$) on only 3 of 10 seeds, with a median of $3.1\times10^{-2}$, a range of $2.5\times10^{-3}$ to $1.28$, and one seed diverging outright ($1.28$)---so the single-seed $5.2\times10^{-2}$ sits above the $3.1\times10^{-2}$ median ($\approx\!1.7\times$) and hides both the spread and the divergent seed. Re-running the \emph{same} 10 seeds with the per-stage restart ($\approx\!30\%$ warmup, described above)---a controlled A/B, identical seeds and protocol apart from the restart---raises the in-basin fraction from 3/10 to \textbf{8/10}, drops the median from $3.1\times10^{-2}$ to $3.3\times10^{-3}$ ($\sim\!10\times$), and eliminates the divergences (worst case $6.7\times10^{-3}$ vs.\ $1.28$): per seed, the restart takes the diverging seed from $1.28$ to $3.1\times10^{-3}$ and the worst gap seed from $2.4\times10^{-1}$ to $6.7\times10^{-3}$. The two seeds still just outside the basin ($5.6$ and $6.7\times10^{-3}$) are marginal, not failures. The restart is therefore the controlling lever at 2 qubits, a controlled contrast rather than a directional one. At 3 qubits, the per-stage restart across $n = 5$ seeds (\texttt{base\_seed = 2001..2005}) reaches the correct basin on \emph{all 5}, with a median of $4.0\times10^{-3}$ and a tight range of $3.2$--$4.4\times10^{-3}$, insensitive to evaluation collocation density ($100 \approx 200$ points); the single-seed no-restart $1.7\times10^{-3}$ reported in Table~\ref{tab:headline} was one such favorable draw, and no-restart 3q is correspondingly unreliable (1 of 3 in the initial screen). The consistent picture across qubit count is therefore: the plain combination is single-seed-optimistic and multi-seed-unreliable at 2--3 qubits, while the per-stage learning-rate restart delivers \emph{reliable} closure and transfers up the ladder (2q 8/10 matched-seed, 3q 5/5). There is no qubit wall---3q-with-restart is in fact the tightest multi-seed set---but the honest headline is reliable closure via the restart, not the lucky-seed multipliers.
 
-Prior work on analytic constraints in neural emulators demonstrates that architectural enforcement can satisfy conservation laws to machine precision and improve constraint-sensitive outputs without degrading overall accuracy \cite{beucler2021}.
-To align with this framing, we compare unconstrained (UC), loss-constrained (LC), and architecture-constrained (AC) variants on the same Lindblad task.
-Figure~\ref{fig:constraint_compare} shows that the unconstrained model violates physical constraints, while the penalty-based baseline reduces but does not eliminate violations, and the constraint-preserving PINN maintains consistency.
+\section{Code and Data Availability}
+\label{sec:availability}
 
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.9\linewidth]{figures/spectral_bias/constraint_violation_comparison.png}
-\caption{Constraint violation comparison for UC (unconstrained), LC (loss-constrained baseline), and AC (architecture-constrained) models.}
-\label{fig:constraint_compare}
-\end{figure}
-
-\begin{figure}[H]
-\centering
-\begin{minipage}{0.48\textwidth}
-\centering
-\includegraphics[width=\linewidth]{figures/fig_constraint_violation.pdf}
-\end{minipage}
-\hfill
-\begin{minipage}{0.48\textwidth}
-\centering
-\includegraphics[width=\linewidth]{figures/fig_eigenvalue_evolution.pdf}
-\end{minipage}
-\caption{Constraint preservation versus baseline. Left: trace constraint violations. Right: minimum eigenvalue evolution highlighting positivity failures in the baseline.}
-\label{fig:constraints}
-\end{figure}
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.75\textwidth]{figures/fig_dynamics.png}
-\caption{Learned dynamics for the trained model. Populations remain stable while coherence decays under pure dephasing.}
-\label{fig:dynamics}
-\end{figure}
-
-\section{Hardware Validation Pipeline}
-
-To compare model predictions with physical experiments we developed a validation pipeline using IBM quantum hardware.
-This hardware protocol is used as a diagnostic consistency check for stationary dephasing behavior, not as a direct validation of the $|+\rangle\langle+|$ initial-condition experiment used in training.
-
-The hardware preparation approximates a maximally mixed state by executing circuits initialized to $|0\rangle$ and $|1\rangle$ with equal probability and averaging measurement results.
-This is deliberately distinct from the model initial condition and is used to probe stationary behavior under dephasing.
-
-Quantum evolution is implemented using a stochastic Pauli-frame unraveling of the dephasing channel rather than direct Kraus insertions.
-Each trajectory tracks a classical frame bit and updates the effective $R_y$ sign accordingly, preserving the target Lindblad statistics while keeping circuits shallow.
-
-Under stochastic unraveling, the dephasing channel can be written as
-\begin{equation}
-\rho \rightarrow (1-p)\rho + p\,\sigma_z \rho \sigma_z
-\label{unravel}
-\end{equation}
-with $p = \frac{1}{2}(1-e^{-2\gamma \tau})$.
-Pauli-frame tracking implements this channel classically by updating the effective measurement frame rather than inserting explicit $\sigma_z$ gates.
-
-Each validation point involves
-
-\begin{enumerate}
-\item generating PINN predictions
-\item constructing corresponding circuits
-\item executing circuits on IBM hardware
-\item collecting measurement statistics
-\item comparing probabilities $P(|0\rangle)$
-\end{enumerate}
-
-\section{Hardware Discrepancy as Diagnostic}
-
-Initial experiments showed disagreement between PINN predictions and hardware results.
-
-The model predicted evolving probabilities
-
-\[
-P(|0\rangle) = 0.11 \rightarrow 0.87 \rightarrow 0.42
-\]
-
-while hardware consistently measured approximately
-
-\[
-P(|0\rangle) \approx 0.5
-\]
-
-This discrepancy arose from a mismatch between the model initial condition and the hardware preparation.
-
-Because the hardware began in a maximally mixed state, which lies in the stationary manifold of pure dephasing dynamics, the measured probabilities remained constant.
-This behavior is consistent with Eq.~(\ref{lindblad}) under pure dephasing, since the maximally mixed state in Eq.~(\ref{maxmixed}) belongs to the stationary manifold.
-
-Thus hardware validation revealed an inconsistency in the experimental setup rather than a failure of the neural architecture.
-Following identification of the initial-condition mismatch, we re-ran the training and validation pipeline to ensure that all reported simulation statistics and hardware comparisons were generated under the corrected interpretation of the diagnostic protocol.
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.75\textwidth]{figures/fig_hardware_comparison.pdf}
-\caption{Hardware diagnostic comparison. The PINN prediction varies in time while hardware measurements remain near the stationary expectation for the maximally mixed state.}
-\label{fig:hardware-comparison}
-\end{figure}
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.75\textwidth]{figures/fig_hardware_metrics.pdf}
-\caption{Hardware validation metrics summarizing probability differences and fidelity by validation time point.}
-\label{fig:hardware-metrics}
-\end{figure}
-
-\section{Discussion}
-
-The central result of this work is architectural rather than purely numerical.
-By parameterizing the density matrix as a trace-normalized Gram matrix, the network output is restricted to the physically admissible state manifold throughout training and evaluation.
-This differs fundamentally from penalty-based PINNs, where Hermiticity, trace normalization, and positivity remain soft objectives that can be violated during optimization even when the final loss is small.
-In this sense, the present approach removes an entire class of failure modes rather than merely reducing their frequency.
-
-This perspective is consistent with a broader view emerging in the PINN literature: many training pathologies are not solely optimizer issues, but reflect a mismatch between the geometry of the target solution space and the parameterization used to represent it \cite{wang2020gradient,jiang2025deeperpinns}.
-The spectral-bias literature suggests that gradient-based networks preferentially learn low-frequency or overly smooth components first, which can encourage trivial or nearly stationary solutions in physics-constrained settings \cite{rahaman2019,xu2018,arpit2017,neyshabur2014,zhang2017}.
-Our results support that interpretation.
-The penalty-based baseline is more vulnerable to unphysical trajectories and fixed-point-like behavior, whereas the constraint-preserving PINN preserves validity by construction and therefore narrows the space of admissible failure modes.
-
-The significance of the method is also not limited to the single dephasing example emphasized in the main text.
-As reflected in the comparative analyses reported above, the same architectural idea remains compatible with qualitatively different training regimes and evaluation settings, including frequency-domain diagnostics, gradient-pathology analysis, and depth-dependent refinement studies.
-Across these settings, the key advantage is not that the constrained model must achieve the lowest trajectory error in every experiment, but that it reliably excludes non-physical outputs.
-That distinction matters in quantum applications, where a numerically accurate but non-positive density matrix is not merely imperfect --- it is physically uninterpretable.
-
-The hardware study should be understood in this same architectural framework.
-Its main value is diagnostic, not celebratory.
-The disagreement between PINN predictions and IBM hardware did not invalidate the constraint-preserving PINN; instead, it exposed a mismatch between the modeled initial condition and the state preparation implemented on hardware, and clarified the role of stationary states in Lindblad dynamics.
-This is an important methodological point: hardware comparisons can reveal hidden inconsistencies in modeling assumptions even when they do not yet constitute a full end-to-end validation of non-trivial learned dynamics.
-
-Several limitations remain.
-The present paper is still fundamentally a one-qubit study, and extension to multi-qubit systems will require generalized initial-condition enforcement and more demanding optimization.
-Likewise, while the hardware pipeline is useful as a consistency check, direct hardware validation of the IC-enforced non-trivial dynamics remains future work.
-The broader implication is therefore best stated carefully: constraint-preserving architectures provide a robust foundation for quantum PINNs, and hardware-aware diagnostics provide a practical way to stress-test the physical assumptions built into those models.
+\begin{sloppypar}
+Source code, run manifests, and the figure-generation pipeline are at
+\url{https://github.com/nhangen/DecoN}. Within the repository:
+\begin{itemize}
+\item Paper sources: \texttt{pre-print/arxiv-v3/}.
+\item Experiment manifests: \texttt{experiments/DeCoN-PINN/}.
+\item Figure-generation script:
+  \texttt{scripts/paper/generate\_arxiv\_v3\_figures.py}.
+\item Architectures (under \texttt{models/}): the
+  \texttt{\{One,Two,Three,Four\}QubitUnitaryPINN} family,
+  \texttt{OneQubitKrausPINN}, and \texttt{ChebyshevUnitaryPINN}.
+\item Trainer entry point: \texttt{scripts/train/safe\_batch\_trainer.py};
+  loss-modification options from Table~\ref{tab:six-failed} are exposed as
+  CLI flags
+  (\texttt{-{}-curriculum-stages},
+  \texttt{-{}-semigroup-weight},
+  \texttt{-{}-terminal-pin-weight},
+  \texttt{-{}-supervised-weight},
+  \texttt{-{}-alm-initial-mu},
+  \texttt{-{}-n-basis}).
+\end{itemize}
+\end{sloppypar}
 
 \section{Conclusion}
 
-We introduced a constraint-preserving PINN architecture that guarantees valid quantum density matrices by construction, replacing soft constraint penalties with an explicit representation of the physical state manifold.
+The constraint-preserving PINN methodology of~\cite{hangen2024constraint} generalizes to longer time intervals and closed-system multi-qubit dynamics with one consistent failure mode that we characterize as the local-vs-global gap: physics residual at $N$ collocation points converges while the trajectory drifts. The gap is not closed by any of six loss-formulation modifications we tested. It is closed consistently across 1, 2, and 3 qubits by combining a structural extension of the architecture (unitary parameterization with structural IC anchoring) and a training-side modification (time-marching curriculum). Neither change alone suffices.
 
-Across repeated trials and comparative analyses, the main benefit of this approach is not simply improved stability, but the exclusion of non-physical outputs that remain possible in penalty-based baselines.
+The original constraint-preserving result holds on the problem it solved; the gap is a scaling artifact at longer intervals and sustained-oscillation dynamics. Open-system curriculum methodology remains an open problem.
 
-We further showed that quantum hardware comparison can serve as a diagnostic tool: rather than merely confirming agreement, it can expose hidden inconsistencies in initial conditions and dynamical assumptions.
-
-Taken together, these results position constraint-preserving PINNs as a robust foundation for reliable open-system modeling and for future hardware-aware validation workflows.
-
-\section*{Appendix: Spectral Bias Supplement}
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=\linewidth]{figures/spectral_bias/spectral_bias_appendix_grid.png}
-\caption{Supplemental spectral-bias panels. Top row: spectral error trajectories and final spectra comparisons. Bottom row: Bloch-vector spectra for baseline and constraint-preserving models.}
-\label{fig:spectral_appendix}
-\end{figure}
-
-\newpage
 \bibliographystyle{plain}
 \bibliography{references}
-
 
 \end{document}
